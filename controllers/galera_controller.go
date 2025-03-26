@@ -779,6 +779,75 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 		return ctrl.Result{}, err
 	}
 
+	// Iterate over all Galera pods and identify the node they are assigned to.
+	// For each node, check if it contains the "node.kubernetes.io/out-of-service" taint.
+	// If the taint is present, assume the node is being decommissioned or undergoing remediation.
+	// In that case, delete the pod's associated PVC (named based on the pod name) to allow
+	// the StatefulSet controller to re-create the pod and its volume on a different node.
+	log.Info("Scanning Galera pods for out-of-service tainted nodes")
+
+	for _, pod := range podList.Items {
+		nodeName := pod.Spec.NodeName
+		if nodeName == "" {
+			log.Info("Pod not yet scheduled on a node", "pod", pod.Name)
+			continue
+		}
+
+		log.Info("Inspecting assigned node", "pod", pod.Name, "node", nodeName)
+
+		var node *corev1.Node
+		for i := range nodes.Items {
+			if nodes.Items[i].Name == nodeName {
+				node = &nodes.Items[i]
+				break
+			}
+		}
+
+		if node == nil {
+			log.Info("Node not found in cluster node list", "node", nodeName)
+			continue
+		}
+
+		if len(node.Spec.Taints) == 0 {
+			log.Info("Node has no taints", "node", nodeName)
+			continue
+		}
+
+		for _, taint := range node.Spec.Taints {
+			log.Info("Found taint on node", "node", node.Name, "taint.key", taint.Key, "taint.value", taint.Value)
+
+			if taint.Key == "node.kubernetes.io/out-of-service" {
+				pvcName := "mysql-db-" + pod.Name
+				log.Info("Node marked as out-of-service: deleting PVC to trigger reschedule",
+					"node", nodeName,
+					"pod", pod.Name,
+					"pvc", pvcName)
+
+				pvc := &corev1.PersistentVolumeClaim{}
+				err := r.Client.Get(ctx, types.NamespacedName{
+					Name:      pvcName,
+					Namespace: pod.Namespace,
+				}, pvc)
+				if err != nil {
+					if k8s_errors.IsNotFound(err) {
+						log.Info("PVC not found, skipping deletion", "pvc", pvcName)
+					} else {
+						log.Error(err, "Failed to get PVC for deletion", "pvc", pvcName)
+					}
+					continue
+				}
+
+				err = r.Client.Delete(ctx, pvc)
+				if err != nil {
+					log.Error(err, "Failed to delete PVC", "pvc", pvcName)
+				} else {
+					log.Info("PVC deleted successfully", "pvc", pvcName)
+				}
+				break
+			}
+		}
+	}
+
 	//
 	// Reconstruct the state of the galera resource based on the replicaset and its pods
 	//
