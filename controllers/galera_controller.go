@@ -786,6 +786,14 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 	// the StatefulSet controller to re-create the pod and its volume on a different node.
 	log.Info("Scanning Galera pods for out-of-service tainted nodes")
 
+	// Retrieve list of all nodes once before iterating pods
+	var nodeList corev1.NodeList
+	if err := r.Client.List(ctx, &nodeList); err != nil {
+		log.Error(err, "Failed to list nodes")
+		return ctrl.Result{}, err
+	}
+	nodes := nodeList.Items
+
 	for _, pod := range podList.Items {
 		nodeName := pod.Spec.NodeName
 		if nodeName == "" {
@@ -796,9 +804,9 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 		log.Info("Inspecting assigned node", "pod", pod.Name, "node", nodeName)
 
 		var node *corev1.Node
-		for i := range nodes.Items {
-			if nodes.Items[i].Name == nodeName {
-				node = &nodes.Items[i]
+		for i := range nodes {
+			if nodes[i].Name == nodeName {
+				node = &nodes[i]
 				break
 			}
 		}
@@ -843,7 +851,8 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 				} else {
 					log.Info("PVC deleted successfully", "pvc", pvcName)
 				}
-				break
+
+				break // stop checking other taints for this node
 			}
 		}
 	}
