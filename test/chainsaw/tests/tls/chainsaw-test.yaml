@@ -40,6 +40,34 @@ spec:
     - delete:
         file: ../../common/galera-tls.yaml
 
+  - name: TLS with custom wsrep_provider_options
+    description: Deploy TLS Galera with custom wsrep tunables and verify merge with operator TLS options
+    bindings:
+    - name: replicas
+      value: 3
+    - name: cert
+      value: galera-cert
+    try:
+    - apply:
+        file: ../../common/tls-certificate.yaml
+    - apply:
+        file: ../../common/galera-tls-custom-wsrep.yaml
+    - assert:
+        file: ../../common/galera-assert.yaml
+    - script:
+        content: |
+          ../../scripts/mysql-cli.sh -sNEe "show status like 'wsrep_cluster_size';" | tail -1 | tr -d '\n'
+        check:
+          (to_number($stdout)): ($replicas)
+    - script:
+        content: |
+          ../../scripts/mysql-cli.sh -sNe "select @@global.wsrep_provider_options;"
+        check:
+          (contains($stdout, 'socket.ssl = YES')): true
+          (contains($stdout, 'gcache.size=4G')): true
+    - delete:
+        file: ../../common/galera-tls-custom-wsrep.yaml
+
   - name: Brownfield - 1 - deploy without TLS
     description: Deploy a 3-note cluster without TLS
     bindings:

@@ -1046,8 +1046,17 @@ func (r *GaleraReconciler) generateConfigMaps(
 		"logToDisk":          instance.Spec.LogToDisk,
 		"galeraInstanceName": instance.Name,
 	}
+	customConfig := instance.Spec.CustomServiceConfig
+	if instance.Spec.TLS.Enabled() && instance.Spec.TLS.CaBundleSecretName != "" {
+		var err error
+		customConfig, err = mariadb.ApplyMergedWsrepToCustomConfig(customConfig)
+		if err != nil {
+			log.Error(err, "Unable to merge wsrep_provider_options into customServiceConfig")
+			return err
+		}
+	}
 	customData := make(map[string]string)
-	customData[mariadbv1.CustomServiceConfigFile] = instance.Spec.CustomServiceConfig
+	customData[mariadbv1.CustomServiceConfigFile] = customConfig
 
 	cms := []util.Template{
 		// ScriptsConfigMap

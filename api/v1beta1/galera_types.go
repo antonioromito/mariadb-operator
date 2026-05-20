@@ -83,7 +83,9 @@ type GaleraSpecCore struct {
 	// +kubebuilder:validation:Optional
 	// Customize config using this parameter to change service defaults,
 	// or overwrite rendered information using raw MariaDB config format.
-	// The content gets added to /etc/my.cnf.d/galera_custom.cnf
+	// The content gets added to /etc/my.cnf.d/30-galera_custom.cnf (loaded last).
+	// When TLS is enabled with a CA bundle, wsrep_provider_options under [mysqld]
+	// are merged with operator TLS defaults; operator socket.ssl_* values take precedence.
 	CustomServiceConfig string `json:"customServiceConfig,omitempty"`
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec

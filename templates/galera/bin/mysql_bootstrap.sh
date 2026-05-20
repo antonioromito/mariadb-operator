@@ -98,6 +98,15 @@ EOF
 }
 
 
+function remove_legacy_galera_cnf_files {
+    # OSPRH-30310: drop unprefixed configs from older releases so they do not
+    # alter MariaDB load order when new 10-/20-/30- files are installed.
+    sudo rm -f /etc/my.cnf.d/galera.cnf \
+        /etc/my.cnf.d/galera_tls.cnf \
+        /etc/my.cnf.d/galera_external_tls.cnf \
+        /etc/my.cnf.d/galera_custom.cnf
+}
+
 function kolla_set_all_configs {
     # set up mounts, permissions, required files
 
@@ -105,6 +114,7 @@ function kolla_set_all_configs {
     # galera or the sidecar logging container
     # NOTE: kolla_set_configs is explicitly allowed in sudoers and needs
     # sudo to set up permissions
+    remove_legacy_galera_cnf_files
     sudo -E kolla_set_configs
 
     # now that /var/local/ is owned by mysql, prepare space for invocations of
