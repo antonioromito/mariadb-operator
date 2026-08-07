@@ -49,7 +49,9 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -1320,9 +1322,10 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	// F1: do not abort the Galera reconcile on remediation errors — core operations
-	// (StatefulSet management, bootstrap, secret rotation) must not be blocked by an
-	// optional feature. Log and continue; the next reconcile will retry.
+	// PVC remediation handshake with PodRemediator (optional feature).
+	// Auto-detects whether PodRemediator is installed; skipped silently if not.
+	// Errors do not abort the core reconcile — StatefulSet management and bootstrap
+	// must not be blocked by an optional feature.
 	if err := r.CheckForStuckPVCRequiringRemediation(ctx, instance, helper); err != nil {
 		log.Error(err, "PVC remediation check failed; skipping this cycle, core reconcile continues")
 	}
@@ -1903,14 +1906,6 @@ func (r *GaleraReconciler) reconcileDelete(ctx context.Context, instance *mariad
 //   - pvc-stuck-on-node  (remediation.openstack.org/pvc-stuck-on-node): set by PodRemediator
 //   - safe-to-delete     (remediation.openstack.org/safe-to-delete):     set by this controller
 //
-// CheckForStuckPVCRequiringRemediation evaluates whether the Galera cluster can
-// safely afford to lose one replica, and if so grants PodRemediator permission to
-// delete one stuck PVC by setting safe-to-delete=true.
-//
-// Annotation contract (shared with infra-operator PodRemediator):
-//   - pvc-stuck-on-node  (remediation.openstack.org/pvc-stuck-on-node): set by PodRemediator
-//   - safe-to-delete     (remediation.openstack.org/safe-to-delete):     set by this controller
-//
 // Safety gates (both must pass):
 //  1. k8s gate: AvailableReplicas >= floor(spec.Replicas/2)+1
 //  2. wsrep gate: live wsrep_cluster_size >= quorum (fail-open on exec errors)
@@ -1925,6 +1920,23 @@ func (r *GaleraReconciler) reconcileDelete(ctx context.Context, instance *mariad
 // this Galera CR via the PVC watch; the resulting reconcile is a cheap no-op.
 func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Context, instance *mariadbv1.Galera, helper *helper.Helper) error {
 	Log := helper.GetLogger()
+
+	// Auto-detect PodRemediator: skip silently if its CRD is not registered on
+	// the API server. The REST mapper uses a local discovery cache so this is not
+	// an API round-trip on every reconcile.
+	// Skipped when r.config is nil (unit-test / envtest context without API server).
+	if r.config != nil {
+		_, mappingErr := r.RESTMapper().RESTMapping(schema.GroupKind{
+			Group: "remediation.openstack.org",
+			Kind:  "PodRemediator",
+		})
+		if mappingErr != nil {
+			if !apimeta.IsNoMatchError(mappingErr) {
+				Log.V(1).Info("REST mapper error checking for PodRemediator; skipping PVC remediation", "error", mappingErr)
+			}
+			return nil
+		}
+	}
 
 	if instance.Spec.Replicas == nil {
 		return nil
