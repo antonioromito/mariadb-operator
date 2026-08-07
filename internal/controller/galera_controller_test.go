@@ -276,3 +276,137 @@ func TestBootstrapState_MultipleInstances(t *testing.T) {
 	}
 }
 
+func TestHighestSeqnoPod_Empty(t *testing.T) {
+	if got := highestSeqnoPod(nil); got != "" {
+		t.Errorf("nil attrs: expected empty string, got %q", got)
+	}
+	if got := highestSeqnoPod(map[string]mariadbv1.GaleraAttributes{}); got != "" {
+		t.Errorf("empty attrs: expected empty string, got %q", got)
+	}
+}
+
+func TestHighestSeqnoPod_SingleNode(t *testing.T) {
+	attrs := map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "100"},
+	}
+	if got := highestSeqnoPod(attrs); got != "galera-0" {
+		t.Errorf("expected galera-0, got %q", got)
+	}
+}
+
+func TestHighestSeqnoPod_MaxSeqno(t *testing.T) {
+	attrs := map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "100"},
+		"galera-1": {Seqno: "200"},
+		"galera-2": {Seqno: "150"},
+	}
+	if got := highestSeqnoPod(attrs); got != "galera-1" {
+		t.Errorf("expected galera-1 (seqno=200), got %q", got)
+	}
+}
+
+func TestHighestSeqnoPod_SafeToBootstrap(t *testing.T) {
+	attrs := map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "100", SafeToBootstrap: true},
+		"galera-1": {Seqno: "999"},
+	}
+	if got := highestSeqnoPod(attrs); got != "galera-0" {
+		t.Errorf("expected galera-0 (SafeToBootstrap wins over higher seqno), got %q", got)
+	}
+}
+
+func TestHighestSeqnoPod_AllEqual_Deterministic(t *testing.T) {
+	attrs := map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "100"},
+		"galera-1": {Seqno: "100"},
+		"galera-2": {Seqno: "100"},
+	}
+	got1 := highestSeqnoPod(attrs)
+	got2 := highestSeqnoPod(attrs)
+	if got1 != got2 {
+		t.Errorf("highestSeqnoPod non-deterministic: got %q then %q", got1, got2)
+	}
+	// All equal → no single winner, must return "".
+	if got1 != "" {
+		t.Errorf("expected empty string on tie, got %q", got1)
+	}
+}
+
+func makeRunningReadyPod(name string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "galera", Ready: true},
+			},
+		},
+	}
+}
+
+func makeRunningNotReadyPod(name string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "galera", Ready: false},
+			},
+		},
+	}
+}
+
+func TestFindReadyPod_NoPods(t *testing.T) {
+	if got := findReadyPod(nil); got != nil {
+		t.Errorf("expected nil for empty list, got %v", got)
+	}
+}
+
+func TestFindReadyPod_NoneReady(t *testing.T) {
+	pods := []corev1.Pod{makeRunningNotReadyPod("galera-0"), makeRunningNotReadyPod("galera-1")}
+	if got := findReadyPod(pods); got != nil {
+		t.Errorf("expected nil when none are ready, got %s", got.Name)
+	}
+}
+
+func TestFindReadyPod_OneReady(t *testing.T) {
+	pods := []corev1.Pod{makeRunningReadyPod("galera-1")}
+	got := findReadyPod(pods)
+	if got == nil {
+		t.Fatal("expected a pod, got nil")
+	}
+	if got.Name != "galera-1" {
+		t.Errorf("expected galera-1, got %s", got.Name)
+	}
+}
+
+func TestFindReadyPod_ReturnsFirstReady(t *testing.T) {
+	pods := []corev1.Pod{
+		makeRunningNotReadyPod("galera-0"),
+		makeRunningReadyPod("galera-1"),
+		makeRunningReadyPod("galera-2"),
+	}
+	got := findReadyPod(pods)
+	if got == nil {
+		t.Fatal("expected a pod, got nil")
+	}
+	if got.Name != "galera-1" {
+		t.Errorf("expected first ready pod galera-1, got %s", got.Name)
+	}
+}
+
+func TestFindReadyPod_NotRunningPhaseSkipped(t *testing.T) {
+	pending := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "galera-0"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "galera", Ready: true},
+			},
+		},
+	}
+	if got := findReadyPod([]corev1.Pod{pending}); got != nil {
+		t.Errorf("expected nil for non-Running pod, got %s", got.Name)
+	}
+}
+
