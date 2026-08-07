@@ -275,3 +275,4 @@ func TestBootstrapState_MultipleInstances(t *testing.T) {
 		t.Error("cell2 should still be in progress")
 	}
 }
+

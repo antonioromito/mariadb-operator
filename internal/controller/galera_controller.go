@@ -79,15 +79,20 @@ const (
 	serviceSecretNameField = ".spec.tls.genericService.SecretName" // #nosec G101 -- This is a field path, not a credential
 	// caSecretNameField specifies the field path for CA bundle secret name
 	caSecretNameField = ".spec.tls.ca.caBundleSecretName" // #nosec G101 -- This is a field path, not a credential
-	topologyField     = ".spec.topologyRef.Name"
+	topologyField = ".spec.topologyRef.Name"
 
-	// PVCStuckOnNodeAnnotation is set by PodRemediator on a PVC when the
-	// PVC is stuck on an unhealthy node. The galera controller watches for
-	// this and responds with SafeToDeleteAnnotation.
+	// PVC remediation annotation contract shared with infra-operator PodRemediator.
+	// These strings MUST stay in sync with the constants defined in:
+	//   github.com/openstack-k8s-operators/infra-operator/apis/remediation/v1beta1/annotations.go
+	// Once infra-operator/apis publishes a tagged release that includes those constants,
+	// replace these definitions with a direct import.
+
+	// PVCStuckOnNodeAnnotation is set by PodRemediator on a Galera PVC when the PVC
+	// is stuck on an unhealthy node. Value is the node name.
 	PVCStuckOnNodeAnnotation = "remediation.openstack.org/pvc-stuck-on-node"
 
-	// SafeToDeleteAnnotation is set by the galera controller on a PVC to
-	// authorize PodRemediator to delete it.
+	// SafeToDeleteAnnotation is set by this controller to authorize PodRemediator
+	// to delete the stuck PVC. Consent is per fault-event.
 	SafeToDeleteAnnotation = "remediation.openstack.org/safe-to-delete"
 )
 
@@ -1168,8 +1173,11 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 		instance.Status.LastAppliedTopology = nil
 	}
 
+	// F1: do not abort the Galera reconcile on remediation errors — core operations
+	// (StatefulSet management, bootstrap, secret rotation) must not be blocked by an
+	// optional feature. Log and continue; the next reconcile will retry.
 	if err := r.CheckForStuckPVCRequiringRemediation(ctx, instance, helper); err != nil {
-		return ctrl.Result{}, err
+		log.Error(err, "PVC remediation check failed; skipping this cycle, core reconcile continues")
 	}
 
 	// if upgrade is not blocked, create or patch the statefulset with the new,
@@ -1549,7 +1557,50 @@ func (r *GaleraReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.findGaleraForMariaDBAccount),
 			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
 		).
+		// Watch PVCs for annotation changes so the Galera controller reacts promptly
+		// when PodRemediator sets pvc-stuck-on-node, rather than waiting for the next
+		// unrelated Galera reconcile event. IsGaleraPVC pre-screens events so only
+		// Galera StatefulSet PVCs (identified by the service label suffix) trigger the
+		// mapper, avoiding unnecessary mapper invocations for all other PVCs.
+		Watches(
+			&corev1.PersistentVolumeClaim{},
+			handler.EnqueueRequestsFromMapFunc(r.FindGaleraForPVC),
+			builder.WithPredicates(predicate.And(
+				predicate.AnnotationChangedPredicate{},
+				predicate.NewPredicateFuncs(IsGaleraPVC),
+			)),
+		).
 		Complete(r)
+}
+
+// IsGaleraPVC returns true when the object is a PVC belonging to a Galera
+// StatefulSet, identified by the service label following the "<name>-galera"
+// convention. Used as a predicate pre-screen so only Galera PVC events reach
+// FindGaleraForPVC, avoiding spurious mapper calls for every other PVC in the cluster.
+func IsGaleraPVC(obj client.Object) bool {
+	svcLabel, ok := obj.GetLabels()[common.AppSelector]
+	return ok && strings.HasSuffix(svcLabel, "-galera")
+}
+
+// FindGaleraForPVC maps a PVC annotation-change event to the owning Galera CR.
+// StatefulSet PVCs carry the label service=<galera-name>-galera so the Galera
+// name can be derived without listing all Galera CRs.
+func (r *GaleraReconciler) FindGaleraForPVC(ctx context.Context, pvc client.Object) []reconcile.Request {
+	svcLabel, ok := pvc.GetLabels()[common.AppSelector]
+	if !ok {
+		return nil
+	}
+	// StatefulSetName("<name>") == "<name>-galera"
+	galeraName := strings.TrimSuffix(svcLabel, "-galera")
+	if galeraName == svcLabel {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Name:      galeraName,
+			Namespace: pvc.GetNamespace(),
+		},
+	}}
 }
 
 // GetDatabaseObject - returns a Galera object.
@@ -1697,13 +1748,35 @@ func (r *GaleraReconciler) reconcileDelete(ctx context.Context, instance *mariad
 	return ctrl.Result{}, nil
 }
 
-// CheckForStuckPVCRequiringRemediation iterates over PVCs belonging to the
-// Galera StatefulSet and, for each PVC that PodRemediator has annotated as
-// stuck on an unhealthy node, sets the safe-to-delete annotation to authorize
-// PodRemediator to delete it.
+// CheckForStuckPVCRequiringRemediation evaluates whether the Galera cluster can
+// safely afford to lose one replica, and if so grants PodRemediator permission to
+// delete one stuck PVC by setting safe-to-delete=true.
+//
+// Annotation contract (shared with infra-operator PodRemediator):
+//   - pvc-stuck-on-node  (remediation.openstack.org/pvc-stuck-on-node): set by PodRemediator
+//   - safe-to-delete     (remediation.openstack.org/safe-to-delete):     set by this controller
+//
+// Safety gate: consent is granted when the cluster has strictly more than a quorum of
+// available replicas, i.e. AvailableReplicas >= floor(spec.Replicas/2)+1 (Galera majority).
+// For the standard 3-node deployment this means AvailableReplicas >= 2.
+// Only ONE PVC receives consent per reconcile: after a deletion the StatefulSet
+// controller updates AvailableReplicas, and the next reconcile re-evaluates before
+// potentially consenting to a second deletion, preventing simultaneous multi-node loss.
+//
+// NOTE: setting safe-to-delete triggers a PVC annotation-change event that re-enqueues
+// this Galera CR via the PVC watch; the resulting reconcile is a cheap no-op (all PVCs
+// already have safe-to-delete=true).
 func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Context, instance *mariadbv1.Galera, helper *helper.Helper) error {
 	Log := helper.GetLogger()
 
+	// F3: guard against a nil Replicas pointer (e.g. missing defaulting webhook).
+	if instance.Spec.Replicas == nil {
+		return nil
+	}
+
+	// List PVCs and, in a single pass, collect candidates sorted by StatefulSet
+	// ordinal (F5: deterministic ordering) and skip the StatefulSet lookup if
+	// there is nothing to consent to (F6: merged loops).
 	pvcList := &corev1.PersistentVolumeClaimList{}
 	listOpts := []client.ListOption{
 		client.InNamespace(instance.Namespace),
@@ -1714,28 +1787,68 @@ func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Cont
 		return err
 	}
 
+	// Collect PVCs that need consent in ordinal order so that, if multiple PVCs
+	// are annotated, we always process the lowest-ordinal replica first.
+	candidates := make([]*corev1.PersistentVolumeClaim, 0)
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if pvc.Annotations == nil {
-			continue
+		if pvc.Annotations != nil &&
+			pvc.Annotations[PVCStuckOnNodeAnnotation] != "" &&
+			pvc.Annotations[SafeToDeleteAnnotation] != "true" {
+			candidates = append(candidates, pvc)
 		}
-		if pvc.Annotations[PVCStuckOnNodeAnnotation] == "" {
-			continue
-		}
-		if pvc.Annotations[SafeToDeleteAnnotation] == "true" {
-			continue
-		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return pvcOrdinal(candidates[i].Name) < pvcOrdinal(candidates[j].Name)
+	})
 
-		oldPVC := pvc.DeepCopy()
-		pvc.Annotations[SafeToDeleteAnnotation] = "true"
-		if err := r.Patch(ctx, pvc, client.MergeFrom(oldPVC)); err != nil {
-			Log.Error(err, "Failed to set safe-to-delete annotation on stuck PVC",
-				"pvc", pvc.Name, "node", pvc.Annotations[PVCStuckOnNodeAnnotation])
-			return err
-		}
-		Log.Info("PVC stuck on unhealthy node; marked safe-to-delete for PodRemediator",
-			"pvc", pvc.Name, "node", pvc.Annotations[PVCStuckOnNodeAnnotation])
+	// Safety check: the cluster must have at least quorum replicas available so
+	// it survives losing one more.  quorum = floor(spec.Replicas/2)+1 (Galera majority).
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      mariadb.StatefulSetName(instance.Name),
+		Namespace: instance.Namespace,
+	}, sts); err != nil {
+		Log.Error(err, "Failed to get StatefulSet for PVC remediation safety check")
+		return err
+	}
+	quorum := *instance.Spec.Replicas/2 + 1
+	if sts.Status.AvailableReplicas < quorum {
+		Log.Info("Galera cluster does not have enough replicas to safely lose one more; deferring PVC remediation consent",
+			"availableReplicas", sts.Status.AvailableReplicas,
+			"required", quorum,
+			"specReplicas", *instance.Spec.Replicas)
+		return nil
 	}
 
+	// Grant consent to the lowest-ordinal candidate only.
+	// One per reconcile: the StatefulSet controller updates AvailableReplicas after
+	// the deletion, and the next reconcile re-evaluates quorum before consenting again.
+	candidate := candidates[0]
+	oldPVC := candidate.DeepCopy()
+	candidate.Annotations[SafeToDeleteAnnotation] = "true"
+	if err := r.Patch(ctx, candidate, client.MergeFrom(oldPVC)); err != nil {
+		Log.Error(err, "Failed to set safe-to-delete annotation on stuck PVC",
+			"pvc", candidate.Name, "node", candidate.Annotations[PVCStuckOnNodeAnnotation])
+		return err
+	}
+	Log.Info("Cluster healthy; granted safe-to-delete consent for stuck PVC",
+		"pvc", candidate.Name, "node", candidate.Annotations[PVCStuckOnNodeAnnotation],
+		"availableReplicas", sts.Status.AvailableReplicas)
 	return nil
+}
+
+// pvcOrdinal extracts the numeric ordinal suffix from a StatefulSet PVC name.
+// StatefulSet PVCs are named "<volumeClaimTemplate>-<statefulset>-<ordinal>".
+// Returns 0 if the suffix cannot be parsed, which keeps ordering stable.
+func pvcOrdinal(name string) int {
+	parts := strings.Split(name, "-")
+	if len(parts) == 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(parts[len(parts)-1])
+	return n
 }
