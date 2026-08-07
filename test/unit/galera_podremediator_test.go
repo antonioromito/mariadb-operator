@@ -22,12 +22,17 @@ import (
 	"context"
 	"testing"
 
-	controller "github.com/openstack-k8s-operators/mariadb-operator/internal/controller"
+	"github.com/go-logr/logr"
 	mariadbv1 "github.com/openstack-k8s-operators/mariadb-operator/api/v1beta1"
+	controller "github.com/openstack-k8s-operators/mariadb-operator/internal/controller"
+	mariadb "github.com/openstack-k8s-operators/mariadb-operator/internal/mariadb"
+	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -170,5 +175,162 @@ func TestQuorumThreshold(t *testing.T) {
 					tc.specReplicas, tc.available, quorum, got, tc.wantConsent)
 			}
 		})
+	}
+}
+
+func int32Ptr(i int32) *int32 { return &i }
+
+// buildTestScheme registers all types needed by CheckForStuckPVCRequiringRemediation.
+func buildTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{
+		mariadbv1.AddToScheme,
+		corev1.AddToScheme,
+		appsv1.AddToScheme,
+	} {
+		if err := add(s); err != nil {
+			t.Fatalf("AddToScheme: %v", err)
+		}
+	}
+	return s
+}
+
+// makeTestHelper constructs a lib-common Helper backed by the given fake client.
+// kclient is nil because our test code path never reaches ExecInPod (r.config == nil).
+func makeTestHelper(t *testing.T, instance *mariadbv1.Galera, c client.Client, s *runtime.Scheme) *helper.Helper {
+	t.Helper()
+	h, err := helper.NewHelper(instance, c, nil, s, logr.Discard())
+	if err != nil {
+		t.Fatalf("helper.NewHelper: %v", err)
+	}
+	return h
+}
+
+// makeTestInstance creates a Galera instance with a stable UID so StatefulSetLabels
+// produces deterministic label selectors usable with the fake client.
+func makeTestInstance(ns, name string, replicas int32) *mariadbv1.Galera {
+	return &mariadbv1.Galera{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			UID:       types.UID("test-uid-" + name),
+		},
+		Spec: mariadbv1.GaleraSpec{
+			GaleraSpecCore: mariadbv1.GaleraSpecCore{
+				Replicas: int32Ptr(replicas),
+			},
+		},
+	}
+}
+
+// makeGaleraPVC creates a PVC with labels matching StatefulSetLabels(instance).
+func makeGaleraPVC(name string, instance *mariadbv1.Galera, annotations map[string]string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   instance.Namespace,
+			Labels:      mariadb.StatefulSetLabels(instance),
+			Annotations: annotations,
+		},
+	}
+}
+
+// makeTestSTS creates a StatefulSet for the quorum gate with the given AvailableReplicas.
+func makeTestSTS(instance *mariadbv1.Galera, available int32) *appsv1.StatefulSet {
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mariadb.StatefulSetName(instance.Name),
+			Namespace: instance.Namespace,
+		},
+		Status: appsv1.StatefulSetStatus{
+			AvailableReplicas: available,
+		},
+	}
+}
+
+// TestPVCRemediationStatus_NoCandidates: no stuck PVCs → status is nil.
+func TestPVCRemediationStatus_NoCandidates(t *testing.T) {
+	s := buildTestScheme(t)
+	instance := makeTestInstance("test-ns", "galera", 3)
+	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, nil)
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(instance, pvc).Build()
+	h := makeTestHelper(t, instance, c, s)
+	r := &controller.GaleraReconciler{Client: c}
+
+	if err := r.CheckForStuckPVCRequiringRemediation(context.Background(), instance, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if instance.Status.PVCRemediation != nil {
+		t.Errorf("expected nil PVCRemediation when no PVCs are annotated, got %v", instance.Status.PVCRemediation)
+	}
+}
+
+// TestPVCRemediationStatus_OneStuck: PVC annotated as stuck, quorum gate blocks consent
+// (AvailableReplicas=0). Status must reflect the stuck PVC with ConsentGranted=false.
+func TestPVCRemediationStatus_OneStuck(t *testing.T) {
+	s := buildTestScheme(t)
+	instance := makeTestInstance("test-ns", "galera", 3)
+	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
+		"remediation.openstack.org/pvc-stuck-on-node": "worker-0",
+	})
+	sts := makeTestSTS(instance, 0) // AvailableReplicas=0 < quorum=2 → blocks consent
+
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(instance, pvc).
+		WithStatusSubresource(sts).
+		WithObjects(sts).
+		Build()
+	h := makeTestHelper(t, instance, c, s)
+	r := &controller.GaleraReconciler{Client: c}
+
+	if err := r.CheckForStuckPVCRequiringRemediation(context.Background(), instance, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if instance.Status.PVCRemediation == nil {
+		t.Fatal("expected non-nil PVCRemediation when a PVC is stuck")
+	}
+	entry, ok := instance.Status.PVCRemediation[pvc.Name]
+	if !ok {
+		t.Fatalf("expected entry for %s in PVCRemediation", pvc.Name)
+	}
+	if entry.StuckNode != "worker-0" {
+		t.Errorf("StuckNode: got %q, want %q", entry.StuckNode, "worker-0")
+	}
+	if entry.ConsentGranted {
+		t.Error("ConsentGranted should be false: quorum gate must block consent")
+	}
+}
+
+// TestPVCRemediationStatus_AlreadyConsented: PVC already has safe-to-delete=true.
+// Not a candidate for new consent; status must show ConsentGranted=true.
+func TestPVCRemediationStatus_AlreadyConsented(t *testing.T) {
+	s := buildTestScheme(t)
+	instance := makeTestInstance("test-ns", "galera", 3)
+	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
+		"remediation.openstack.org/pvc-stuck-on-node": "worker-0",
+		"remediation.openstack.org/safe-to-delete":    "true",
+	})
+
+	// No STS needed: candidates is empty so function returns before STS lookup.
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(instance, pvc).Build()
+	h := makeTestHelper(t, instance, c, s)
+	r := &controller.GaleraReconciler{Client: c}
+
+	if err := r.CheckForStuckPVCRequiringRemediation(context.Background(), instance, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if instance.Status.PVCRemediation == nil {
+		t.Fatal("expected non-nil PVCRemediation for already-consented PVC")
+	}
+	entry, ok := instance.Status.PVCRemediation[pvc.Name]
+	if !ok {
+		t.Fatalf("expected entry for %s", pvc.Name)
+	}
+	if !entry.ConsentGranted {
+		t.Error("ConsentGranted should be true for already-consented PVC")
 	}
 }

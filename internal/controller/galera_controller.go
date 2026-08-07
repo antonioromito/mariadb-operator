@@ -202,6 +202,153 @@ func findBestCandidate(g *mariadbv1.Galera, pods []corev1.Pod, log logr.Logger) 
 	return bestnode, true
 }
 
+// highestSeqnoPod returns the name of the pod holding the most up-to-date Galera
+// state, using the same preference order as findBestCandidate: SafeToBootstrap wins;
+// otherwise the pod with the numerically highest seqno is selected. Returns "" when
+// attrs is empty or all seqnos are equal (no single winner, nothing to protect last).
+// Keys are iterated in sorted order for deterministic output.
+func highestSeqnoPod(attrs map[string]mariadbv1.GaleraAttributes) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+	nodes := make([]string, 0, len(attrs))
+	for node := range attrs {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+
+	for _, node := range nodes {
+		if attrs[node].SafeToBootstrap {
+			return node
+		}
+	}
+
+	bestNode := ""
+	bestSeqno := -2
+	tied := false
+	for _, node := range nodes {
+		seqno, _ := strconv.Atoi(attrs[node].Seqno)
+		if seqno > bestSeqno {
+			bestSeqno = seqno
+			bestNode = node
+			tied = false
+		} else if seqno == bestSeqno {
+			tied = true
+		}
+	}
+	if tied {
+		return ""
+	}
+	return bestNode
+}
+
+// findReadyPod returns the first pod that is Running with all containers Ready.
+// Returns nil when no such pod exists.
+func findReadyPod(pods []corev1.Pod) *corev1.Pod {
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if len(pod.Status.ContainerStatuses) == 0 {
+			continue
+		}
+		allReady := true
+		for _, cs := range pod.Status.ContainerStatuses {
+			if !cs.Ready {
+				allReady = false
+				break
+			}
+		}
+		if allReady {
+			return pod
+		}
+	}
+	return nil
+}
+
+// wsrepClusterSize queries wsrep_cluster_size from a live Galera pod via exec.
+// The mysql CLI is invoked inside the "galera" container with credentials passed
+// directly on argv (no shell, no expansion).
+func (r *GaleraReconciler) wsrepClusterSize(ctx context.Context, h *helper.Helper, pod *corev1.Pod, rootPassword string) (int, error) {
+	cmd := []string{
+		"mysql", "-N", "-uroot", "-p" + rootPassword,
+		"-e", "SHOW STATUS LIKE 'wsrep_cluster_size'",
+	}
+	var clusterSize int
+	err := mariadb.ExecInPod(ctx, h, r.config, pod.Namespace, pod.Name, "galera", cmd,
+		func(stdout *bytes.Buffer, _ *bytes.Buffer) error {
+			line := strings.TrimSpace(stdout.String())
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				return fmt.Errorf("unexpected wsrep_cluster_size output: %q", line)
+			}
+			n, err := strconv.Atoi(parts[len(parts)-1])
+			if err != nil {
+				return fmt.Errorf("cannot parse wsrep_cluster_size %q: %w", parts[len(parts)-1], err)
+			}
+			clusterSize = n
+			return nil
+		},
+	)
+	return clusterSize, err
+}
+
+// wsrepQuorumOK verifies via a live wsrep_cluster_size query that the actual Galera
+// cluster view has at least quorum members. Returns true (fail-open) when:
+//   - r.config is nil (unit-test / envtest context — no kubeconfig available)
+//   - RootDatabaseSecret is not yet set
+//   - the exec or secret fetch fails for any reason (logged as warning)
+//
+// Returns false only when the query succeeds and reports clusterSize < quorum.
+func (r *GaleraReconciler) wsrepQuorumOK(ctx context.Context, instance *mariadbv1.Galera, h *helper.Helper, quorum int32, Log logr.Logger) bool {
+	if r.config == nil {
+		return true
+	}
+	if instance.Status.RootDatabaseSecret == "" {
+		return true
+	}
+
+	rootSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      instance.Status.RootDatabaseSecret,
+		Namespace: instance.Namespace,
+	}, rootSecret); err != nil {
+		Log.Info("wsrep check skipped: could not fetch root secret; falling back to AvailableReplicas gate", "error", err)
+		return true
+	}
+	rootPassword := string(rootSecret.Data[mariadbv1.DatabasePasswordSelector])
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(mariadb.StatefulSetLabels(instance)),
+	); err != nil {
+		Log.Info("wsrep check skipped: could not list pods; falling back to AvailableReplicas gate", "error", err)
+		return true
+	}
+
+	readyPod := findReadyPod(podList.Items)
+	if readyPod == nil {
+		Log.Info("wsrep check skipped: no ready pod found; falling back to AvailableReplicas gate")
+		return true
+	}
+
+	clusterSize, err := r.wsrepClusterSize(ctx, h, readyPod, rootPassword)
+	if err != nil {
+		Log.Info("wsrep check skipped: exec failed; falling back to AvailableReplicas gate", "error", err, "pod", readyPod.Name)
+		return true
+	}
+
+	if clusterSize < int(quorum) {
+		Log.Info("wsrep_cluster_size below quorum; deferring PVC remediation consent",
+			"wsrepClusterSize", clusterSize, "quorum", quorum, "pod", readyPod.Name)
+		return false
+	}
+	Log.V(1).Info("wsrep quorum check passed", "wsrepClusterSize", clusterSize, "quorum", quorum)
+	return true
+}
+
 // buildGcommURI builds a gcomm URI for a galera instance
 // e.g. "gcomm://galera-0.galera,galera-1.galera,galera-2.galera"
 func buildGcommURI(instance *mariadbv1.Galera) string {
@@ -1756,60 +1903,93 @@ func (r *GaleraReconciler) reconcileDelete(ctx context.Context, instance *mariad
 //   - pvc-stuck-on-node  (remediation.openstack.org/pvc-stuck-on-node): set by PodRemediator
 //   - safe-to-delete     (remediation.openstack.org/safe-to-delete):     set by this controller
 //
-// Safety gate: consent is granted when the cluster has strictly more than a quorum of
-// available replicas, i.e. AvailableReplicas >= floor(spec.Replicas/2)+1 (Galera majority).
-// For the standard 3-node deployment this means AvailableReplicas >= 2.
-// Only ONE PVC receives consent per reconcile: after a deletion the StatefulSet
-// controller updates AvailableReplicas, and the next reconcile re-evaluates before
-// potentially consenting to a second deletion, preventing simultaneous multi-node loss.
+// CheckForStuckPVCRequiringRemediation evaluates whether the Galera cluster can
+// safely afford to lose one replica, and if so grants PodRemediator permission to
+// delete one stuck PVC by setting safe-to-delete=true.
+//
+// Annotation contract (shared with infra-operator PodRemediator):
+//   - pvc-stuck-on-node  (remediation.openstack.org/pvc-stuck-on-node): set by PodRemediator
+//   - safe-to-delete     (remediation.openstack.org/safe-to-delete):     set by this controller
+//
+// Safety gates (both must pass):
+//  1. k8s gate: AvailableReplicas >= floor(spec.Replicas/2)+1
+//  2. wsrep gate: live wsrep_cluster_size >= quorum (fail-open on exec errors)
+//
+// Ordering: the PVC of the pod with the highest seqno (most up-to-date data) receives
+// consent last; among the rest, lowest ordinal first. Only one PVC per reconcile.
+//
+// Status: instance.Status.PVCRemediation is updated on every call to reflect the
+// current annotation state; nil when no PVCs carry pvc-stuck-on-node.
 //
 // NOTE: setting safe-to-delete triggers a PVC annotation-change event that re-enqueues
-// this Galera CR via the PVC watch; the resulting reconcile is a cheap no-op (all PVCs
-// already have safe-to-delete=true).
+// this Galera CR via the PVC watch; the resulting reconcile is a cheap no-op.
 func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Context, instance *mariadbv1.Galera, helper *helper.Helper) error {
 	Log := helper.GetLogger()
 
-	// F3: guard against a nil Replicas pointer (e.g. missing defaulting webhook).
 	if instance.Spec.Replicas == nil {
 		return nil
 	}
 
-	// List PVCs and, in a single pass, collect candidates sorted by StatefulSet
-	// ordinal (F5: deterministic ordering) and skip the StatefulSet lookup if
-	// there is nothing to consent to (F6: merged loops).
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	listOpts := []client.ListOption{
+	if err := r.List(ctx, pvcList,
 		client.InNamespace(instance.Namespace),
 		client.MatchingLabels(mariadb.StatefulSetLabels(instance)),
-	}
-	if err := r.List(ctx, pvcList, listOpts...); err != nil {
+	); err != nil {
 		Log.Error(err, "Failed to list PVCs for Galera StatefulSet")
 		return err
 	}
 
-	// Collect PVCs that need consent in ordinal order so that, if multiple PVCs
-	// are annotated, we always process the lowest-ordinal replica first.
+	// Single pass: build PVC remediation status (Feature 2) and candidates list.
+	// All PVCs with pvc-stuck-on-node appear in the status map; only those without
+	// safe-to-delete are candidates for consent this reconcile.
+	newRemediationStatus := make(map[string]mariadbv1.PVCRemediationStatus)
 	candidates := make([]*corev1.PersistentVolumeClaim, 0)
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if pvc.Annotations != nil &&
-			pvc.Annotations[PVCStuckOnNodeAnnotation] != "" &&
-			pvc.Annotations[SafeToDeleteAnnotation] != "true" {
+		if pvc.Annotations == nil || pvc.Annotations[PVCStuckOnNodeAnnotation] == "" {
+			continue
+		}
+		entry := mariadbv1.PVCRemediationStatus{
+			StuckNode:      pvc.Annotations[PVCStuckOnNodeAnnotation],
+			ConsentGranted: pvc.Annotations[SafeToDeleteAnnotation] == "true",
+		}
+		newRemediationStatus[pvc.Name] = entry
+		if !entry.ConsentGranted {
 			candidates = append(candidates, pvc)
 		}
 	}
+
+	// Persist remediation state; nil when cluster is healthy (no stuck PVCs).
+	if len(newRemediationStatus) == 0 {
+		instance.Status.PVCRemediation = nil
+	} else {
+		instance.Status.PVCRemediation = newRemediationStatus
+	}
+
 	if len(candidates) == 0 {
 		return nil
 	}
-	sort.Slice(candidates, func(i, j int) bool {
+
+	// Feature 1: sort candidates so the highest-seqno pod's PVC receives consent last.
+	// Among the rest, use lowest-ordinal-first (deterministic, protects quorum).
+	highPod := highestSeqnoPod(instance.Status.Attributes)
+	stsName := mariadb.StatefulSetName(instance.Name)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		pi := fmt.Sprintf("%s-%d", stsName, pvcOrdinal(candidates[i].Name))
+		pj := fmt.Sprintf("%s-%d", stsName, pvcOrdinal(candidates[j].Name))
+		if highPod != "" && pi == highPod {
+			return false
+		}
+		if highPod != "" && pj == highPod {
+			return true
+		}
 		return pvcOrdinal(candidates[i].Name) < pvcOrdinal(candidates[j].Name)
 	})
 
-	// Safety check: the cluster must have at least quorum replicas available so
-	// it survives losing one more.  quorum = floor(spec.Replicas/2)+1 (Galera majority).
+	// Safety gate 1 (k8s): cluster must have >= quorum AvailableReplicas.
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, types.NamespacedName{
-		Name:      mariadb.StatefulSetName(instance.Name),
+		Name:      stsName,
 		Namespace: instance.Namespace,
 	}, sts); err != nil {
 		Log.Error(err, "Failed to get StatefulSet for PVC remediation safety check")
@@ -1824,9 +2004,15 @@ func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Cont
 		return nil
 	}
 
-	// Grant consent to the lowest-ordinal candidate only.
-	// One per reconcile: the StatefulSet controller updates AvailableReplicas after
-	// the deletion, and the next reconcile re-evaluates quorum before consenting again.
+	// Safety gate 2 (wsrep): verify actual cluster view, not just k8s pod readiness.
+	// Fail-open: if exec is unavailable or fails the gate is skipped (AvailableReplicas
+	// remains the sole gate), so this never blocks remediation in degraded environments.
+	if !r.wsrepQuorumOK(ctx, instance, helper, quorum, Log) {
+		return nil
+	}
+
+	// Grant consent to first candidate (ordering handled above). One per reconcile so
+	// the STS controller can update AvailableReplicas before we consider the next one.
 	candidate := candidates[0]
 	oldPVC := candidate.DeepCopy()
 	candidate.Annotations[SafeToDeleteAnnotation] = "true"
@@ -1835,6 +2021,13 @@ func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Cont
 			"pvc", candidate.Name, "node", candidate.Annotations[PVCStuckOnNodeAnnotation])
 		return err
 	}
+
+	// Feature 2: reflect consent in status immediately (deferred PatchInstance persists it).
+	if entry, ok := instance.Status.PVCRemediation[candidate.Name]; ok {
+		entry.ConsentGranted = true
+		instance.Status.PVCRemediation[candidate.Name] = entry
+	}
+
 	Log.Info("Cluster healthy; granted safe-to-delete consent for stuck PVC",
 		"pvc", candidate.Name, "node", candidate.Annotations[PVCStuckOnNodeAnnotation],
 		"availableReplicas", sts.Status.AvailableReplicas)

@@ -146,6 +146,16 @@ type GaleraAttributes struct {
 	ContainerID string `json:"containerID,omitempty"`
 }
 
+// PVCRemediationStatus captures the in-progress PVC remediation handshake
+// state for a single PVC as seen by the Galera controller.
+type PVCRemediationStatus struct {
+	// StuckNode is the Kubernetes node name set by PodRemediator on the PVC.
+	StuckNode string `json:"stuckNode"`
+	// ConsentGranted is true once this controller has set safe-to-delete=true on the PVC.
+	// +kubebuilder:default=false
+	ConsentGranted bool `json:"consentGranted,omitempty"`
+}
+
 // GaleraStatus defines the observed state of Galera
 type GaleraStatus struct {
 	// A map of database node attributes for each pod
@@ -178,6 +188,10 @@ type GaleraStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// LastAppliedTopology - the last applied Topology
 	LastAppliedTopology *topologyv1.TopoRef `json:"lastAppliedTopology,omitempty"`
+	// PVCRemediation tracks in-flight PVC remediation handshakes with PodRemediator,
+	// keyed by PVC name. Nil when no PVCs carry the pvc-stuck-on-node annotation.
+	// +kubebuilder:validation:Optional
+	PVCRemediation map[string]PVCRemediationStatus `json:"pvcRemediation,omitempty"`
 }
 
 // +kubebuilder:object:root=true
