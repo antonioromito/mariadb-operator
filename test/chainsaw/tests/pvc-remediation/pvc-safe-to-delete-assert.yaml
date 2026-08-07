@@ -1,0 +1,10 @@
+# Assert that the Galera controller has set safe-to-delete=true on the stuck PVC.
+# The Galera controller reacts to the pvc-stuck-on-node annotation via the PVC watch
+# and sets safe-to-delete=true once the cluster has sufficient quorum.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-db-openstack-galera-0
+  annotations:
+    remediation.openstack.org/pvc-stuck-on-node: worker-0
+    remediation.openstack.org/safe-to-delete: "true"
