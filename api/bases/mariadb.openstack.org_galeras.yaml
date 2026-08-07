@@ -469,6 +469,28 @@ spec:
                   the opentack-operator in the top-level CR (e.g. the ContainerImage)
                 format: int64
                 type: integer
+              pvcRemediation:
+                additionalProperties:
+                  description: |-
+                    PVCRemediationStatus captures the in-progress PVC remediation handshake
+                    state for a single PVC as seen by the Galera controller.
+                  properties:
+                    consentGranted:
+                      default: false
+                      description: ConsentGranted is true once this controller has
+                        set safe-to-delete=true on the PVC.
+                      type: boolean
+                    stuckNode:
+                      description: StuckNode is the Kubernetes node name set by PodRemediator
+                        on the PVC.
+                      type: string
+                  required:
+                  - stuckNode
+                  type: object
+                description: |-
+                  PVCRemediation tracks in-flight PVC remediation handshakes with PodRemediator,
+                  keyed by PVC name. Nil when no PVCs carry the pvc-stuck-on-node annotation.
+                type: object
               rootDatabaseAccount:
                 description: |-
                   RootDatabaseAccount - name of MariaDBAccount being used to maintain
