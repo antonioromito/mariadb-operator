@@ -409,4 +409,3 @@ func TestFindReadyPod_NotRunningPhaseSkipped(t *testing.T) {
 		t.Errorf("expected nil for non-Running pod, got %s", got.Name)
 	}
 }
-
