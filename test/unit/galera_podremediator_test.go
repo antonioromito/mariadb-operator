@@ -23,10 +23,10 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	mariadbv1 "github.com/openstack-k8s-operators/mariadb-operator/api/v1beta1"
 	controller "github.com/openstack-k8s-operators/mariadb-operator/internal/controller"
 	mariadb "github.com/openstack-k8s-operators/mariadb-operator/internal/mariadb"
-	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

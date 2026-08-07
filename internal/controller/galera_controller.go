@@ -51,8 +51,8 @@ import (
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -81,7 +81,7 @@ const (
 	serviceSecretNameField = ".spec.tls.genericService.SecretName" // #nosec G101 -- This is a field path, not a credential
 	// caSecretNameField specifies the field path for CA bundle secret name
 	caSecretNameField = ".spec.tls.ca.caBundleSecretName" // #nosec G101 -- This is a field path, not a credential
-	topologyField = ".spec.topologyRef.Name"
+	topologyField     = ".spec.topologyRef.Name"
 
 	// PVC remediation annotation contract shared with infra-operator PodRemediator.
 	// These strings MUST stay in sync with the constants defined in:
