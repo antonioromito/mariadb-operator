@@ -68,7 +68,7 @@ spec:
             echo "Testing login on $pod..."
             oc exec -n ${NAMESPACE} -c galera $pod -- /bin/sh -c '
               # Clear the cached credentials to force using new password
-              rm -f /var/local/mysql_pw_cache.cnf
+              rm -f /var/local/my.cnf/mysql_pw_cache.cnf
               source /var/lib/operator-scripts/mysql_root_auth.sh
               if [ "$MYSQL_PWD" != "newrootpassword123" ]; then
                 echo "ERROR: password != 'newrootpassword123' (actual: $MYSQL_PWD)"
@@ -120,7 +120,7 @@ spec:
           for pod in openstack-galera-0 openstack-galera-1 openstack-galera-2; do
             echo "Testing hash symbol password on $pod..."
             oc exec -n ${NAMESPACE} -c galera $pod -- /bin/sh -c '
-              rm -f /var/local/mysql_pw_cache.cnf
+              rm -f /var/local/my.cnf/mysql_pw_cache.cnf
               source /var/lib/operator-scripts/mysql_root_auth.sh
               if [ "$MYSQL_PWD" != "'"$EXPECTED_PASSWORD"'" ]; then
                 echo "ERROR: password mismatch (expected: '"$EXPECTED_PASSWORD"', actual: $MYSQL_PWD)"
