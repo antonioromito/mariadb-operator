@@ -477,8 +477,9 @@ spec:
                   properties:
                     consentGranted:
                       default: false
-                      description: ConsentGranted is true once this controller has
-                        set safe-to-delete=true on the PVC.
+                      description: |-
+                        ConsentGranted is true only when safe-to-delete=true and consent-id matches
+                        the PVC's current request-id.
                       type: boolean
                     stuckNode:
                       description: StuckNode is the Kubernetes node name set by PodRemediator

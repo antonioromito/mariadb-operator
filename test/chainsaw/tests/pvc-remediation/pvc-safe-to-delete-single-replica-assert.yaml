@@ -1,0 +1,10 @@
+# Assert request-scoped consent for the second simulated remediation request.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-db-openstack-galera-0
+  namespace: (env('NAMESPACE') || 'openstack')
+  (annotations.`remediation.openstack.org/pvc-stuck-on-node`): worker-0
+  (annotations.`remediation.openstack.org/request-id`): test-request-2
+  (annotations.`remediation.openstack.org/safe-to-delete`): "true"
+  (annotations.`remediation.openstack.org/consent-id`): test-request-2

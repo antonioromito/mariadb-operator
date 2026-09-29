@@ -6,8 +6,8 @@ metadata:
   # and the Galera controller (mariadb-operator).
   #
   # This test simulates PodRemediator's behaviour by manually annotating a Galera PVC with
-  # pvc-stuck-on-node=<node>, then asserts that the Galera controller responds with
-  # safe-to-delete=true once the cluster has sufficient quorum.
+  # pvc-stuck-on-node and a request-id, then asserts that the Galera controller echoes
+  # that request ID as consent-id together with safe-to-delete=true once quorum is sufficient.
   #
   # Prerequisites:
   #   - mariadb-operator with PVC remediation support deployed (podremediator branch)
@@ -41,13 +41,13 @@ spec:
           ${OC_CMD:-oc} patch pvc mysql-db-openstack-galera-0 \
             -n ${NAMESPACE:-openstack} \
             --type=merge \
-            -p '{"metadata":{"annotations":{"remediation.openstack.org/pvc-stuck-on-node":"worker-0"}}}'
+            -p '{"metadata":{"annotations":{"remediation.openstack.org/pvc-stuck-on-node":"worker-0","remediation.openstack.org/request-id":"test-request-1"}}}'
 
   - name: Assert Phase 2 — Galera controller grants safe-to-delete consent
     description: |
       The Galera controller's PVC watch fires on the annotation change and
       CheckForStuckPVCRequiringRemediation runs. With 3 replicas available (>= quorum of 2)
-      it must set safe-to-delete=true on the annotated PVC.
+      it must set safe-to-delete=true and echo the current request-id as consent-id.
     try:
     - assert:
         timeout: 60s
@@ -74,9 +74,8 @@ spec:
 
   - name: Verify annotation cleaned up after node recovery simulation
     description: |
-      Simulate node recovery by removing pvc-stuck-on-node (what PodRemediator Path A does).
-      Verify the Galera controller does not re-add safe-to-delete after the primary annotation
-      is gone (the PVC is no longer stuck).
+      Simulate node recovery by removing the PodRemediator request and consent annotations
+      (what PodRemediator Path A does). Verify that no handshake annotations remain.
     try:
     - script:
         timeout: 30s
@@ -87,7 +86,9 @@ spec:
             --type=json \
             -p='[
               {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1pvc-stuck-on-node"},
-              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1safe-to-delete"}
+              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1request-id"},
+              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1safe-to-delete"},
+              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1consent-id"}
             ]'
     - assert:
         timeout: 30s
@@ -100,10 +101,10 @@ spec:
             -o jsonpath='{.status.pvcRemediation}' 2>/dev/null)
           test -z "$val"
 
-  - name: Verify quorum gate — consent denied when only 1 replica available
+  - name: Verify quorum calculation for a single replica
     description: |
-      Scale down to 1 replica to simulate a degraded cluster (below quorum for 3-node).
-      Annotate a PVC as stuck and assert that safe-to-delete is NOT set (quorum check blocks consent).
+      Scale down to a single replica. The quorum formula requires floor(1/2)+1 = 1
+      available replica, so consent should be granted when that replica is available.
     bindings:
     - name: replicas
       value: 1
@@ -123,14 +124,12 @@ spec:
           ${OC_CMD:-oc} patch pvc mysql-db-openstack-galera-0 \
             -n ${NAMESPACE:-openstack} \
             --type=merge \
-            -p '{"metadata":{"annotations":{"remediation.openstack.org/pvc-stuck-on-node":"worker-0"}}}'
+            -p '{"metadata":{"annotations":{"remediation.openstack.org/pvc-stuck-on-node":"worker-0","remediation.openstack.org/request-id":"test-request-2"}}}'
     - sleep:
         duration: 15s
     - assert:
         timeout: 30s
-        # With 1 replica (quorum=1, need >=1), 1 >= 1 so consent IS granted for 1-node.
-        # This step verifies the quorum formula works: for 1-node spec the threshold is 1.
-        file: pvc-safe-to-delete-assert.yaml
+        file: pvc-safe-to-delete-single-replica-assert.yaml
     finally:
     - script:
         content: |
@@ -139,7 +138,9 @@ spec:
             --type=json \
             -p='[
               {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1pvc-stuck-on-node"},
-              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1safe-to-delete"}
+              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1request-id"},
+              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1safe-to-delete"},
+              {"op":"remove","path":"/metadata/annotations/remediation.openstack.org~1consent-id"}
             ]' 2>/dev/null || true
           ${OC_CMD:-oc} patch -n ${NAMESPACE:-openstack} galera openstack \
             --type='json' \

@@ -29,6 +29,7 @@ import (
 	mariadb "github.com/openstack-k8s-operators/mariadb-operator/internal/mariadb"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -273,7 +274,8 @@ func TestPVCRemediationStatus_OneStuck(t *testing.T) {
 	s := buildTestScheme(t)
 	instance := makeTestInstance("test-ns", "galera", 3)
 	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
-		"remediation.openstack.org/pvc-stuck-on-node": "worker-0",
+		controller.PVCStuckOnNodeAnnotation: "worker-0",
+		controller.RequestIDAnnotation:      "request-1",
 	})
 	sts := makeTestSTS(instance, 0) // AvailableReplicas=0 < quorum=2 → blocks consent
 
@@ -304,14 +306,16 @@ func TestPVCRemediationStatus_OneStuck(t *testing.T) {
 	}
 }
 
-// TestPVCRemediationStatus_AlreadyConsented: PVC already has safe-to-delete=true.
-// Not a candidate for new consent; status must show ConsentGranted=true.
+// TestPVCRemediationStatus_AlreadyConsented: status accepts only consent bound
+// to the PVC's current request ID.
 func TestPVCRemediationStatus_AlreadyConsented(t *testing.T) {
 	s := buildTestScheme(t)
 	instance := makeTestInstance("test-ns", "galera", 3)
 	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
-		"remediation.openstack.org/pvc-stuck-on-node": "worker-0",
-		"remediation.openstack.org/safe-to-delete":    "true",
+		controller.PVCStuckOnNodeAnnotation: "worker-0",
+		controller.RequestIDAnnotation:      "request-1",
+		controller.SafeToDeleteAnnotation:   "true",
+		controller.ConsentIDAnnotation:      "request-1",
 	})
 
 	// No STS needed: candidates is empty so function returns before STS lookup.
@@ -332,5 +336,153 @@ func TestPVCRemediationStatus_AlreadyConsented(t *testing.T) {
 	}
 	if !entry.ConsentGranted {
 		t.Error("ConsentGranted should be true for already-consented PVC")
+	}
+}
+
+func TestPVCRemediationStatus_GrantsRequestScopedConsent(t *testing.T) {
+	s := buildTestScheme(t)
+	instance := makeTestInstance("test-ns", "galera", 3)
+	const requestID = "request-current"
+	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
+		controller.PVCStuckOnNodeAnnotation: "worker-0",
+		controller.RequestIDAnnotation:      requestID,
+	})
+	sts := makeTestSTS(instance, 2)
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(instance, pvc, sts).Build()
+	h := makeTestHelper(t, instance, c, s)
+	r := &controller.GaleraReconciler{Client: c}
+
+	if err := r.CheckForStuckPVCRequiringRemediation(context.Background(), instance, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}, got); err != nil {
+		t.Fatalf("get updated PVC: %v", err)
+	}
+	if got.Annotations[controller.SafeToDeleteAnnotation] != "true" {
+		t.Errorf("safe-to-delete = %q, want true", got.Annotations[controller.SafeToDeleteAnnotation])
+	}
+	if got.Annotations[controller.ConsentIDAnnotation] != requestID {
+		t.Errorf("consent-id = %q, want current request ID %q", got.Annotations[controller.ConsentIDAnnotation], requestID)
+	}
+	if entry := instance.Status.PVCRemediation[pvc.Name]; !entry.ConsentGranted {
+		t.Error("status must report current request-scoped consent as granted")
+	}
+}
+
+func TestPVCRemediationStatus_RefreshesStaleConsentForCurrentRequest(t *testing.T) {
+	s := buildTestScheme(t)
+	instance := makeTestInstance("test-ns", "galera", 3)
+	const requestID = "request-current"
+	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
+		controller.PVCStuckOnNodeAnnotation: "worker-0",
+		controller.RequestIDAnnotation:      requestID,
+		controller.SafeToDeleteAnnotation:   "true",
+		controller.ConsentIDAnnotation:      "request-previous",
+	})
+	sts := makeTestSTS(instance, 2)
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(instance, pvc, sts).Build()
+	h := makeTestHelper(t, instance, c, s)
+	r := &controller.GaleraReconciler{Client: c}
+
+	if err := r.CheckForStuckPVCRequiringRemediation(context.Background(), instance, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}, got); err != nil {
+		t.Fatalf("get updated PVC: %v", err)
+	}
+	if got.Annotations[controller.ConsentIDAnnotation] != requestID {
+		t.Errorf("consent-id = %q, want refreshed request ID %q", got.Annotations[controller.ConsentIDAnnotation], requestID)
+	}
+	if entry := instance.Status.PVCRemediation[pvc.Name]; !entry.ConsentGranted {
+		t.Error("status must report refreshed current request consent as granted")
+	}
+}
+
+func TestPVCRemediationStatus_DoesNotAcceptConsentWithoutRequestID(t *testing.T) {
+	s := buildTestScheme(t)
+	instance := makeTestInstance("test-ns", "galera", 3)
+	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
+		controller.PVCStuckOnNodeAnnotation: "worker-0",
+		controller.SafeToDeleteAnnotation:   "true",
+		controller.ConsentIDAnnotation:      "legacy-consent",
+	})
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(instance, pvc).Build()
+	h := makeTestHelper(t, instance, c, s)
+	r := &controller.GaleraReconciler{Client: c}
+
+	if err := r.CheckForStuckPVCRequiringRemediation(context.Background(), instance, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entry := instance.Status.PVCRemediation[pvc.Name]; entry.ConsentGranted {
+		t.Error("consent without a non-empty current request ID must not be accepted")
+	}
+
+	got := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}, got); err != nil {
+		t.Fatalf("get PVC: %v", err)
+	}
+	if got.Annotations[controller.ConsentIDAnnotation] != "legacy-consent" {
+		t.Errorf("controller should not rewrite consent without a current request; got %q", got.Annotations[controller.ConsentIDAnnotation])
+	}
+}
+
+type requestChangeOnPatchClient struct {
+	client.Client
+	requestID string
+	changed   bool
+}
+
+func (c *requestChangeOnPatchClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*corev1.PersistentVolumeClaim); ok && !c.changed {
+		c.changed = true
+		latest := &corev1.PersistentVolumeClaim{}
+		if err := c.Client.Get(ctx, types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}, latest); err != nil {
+			return err
+		}
+		if latest.Annotations == nil {
+			latest.Annotations = make(map[string]string)
+		}
+		latest.Annotations[controller.RequestIDAnnotation] = c.requestID
+		if err := c.Client.Update(ctx, latest); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestPVCRemediationStatus_ConcurrentRequestChangeRejectsConsentPatch(t *testing.T) {
+	s := buildTestScheme(t)
+	instance := makeTestInstance("test-ns", "galera", 3)
+	pvc := makeGaleraPVC("mysql-db-galera-galera-0", instance, map[string]string{
+		controller.PVCStuckOnNodeAnnotation: "worker-0",
+		controller.RequestIDAnnotation:      "request-observed",
+	})
+	sts := makeTestSTS(instance, 2)
+	baseClient := fake.NewClientBuilder().WithScheme(s).WithObjects(instance, pvc, sts).Build()
+	racingClient := &requestChangeOnPatchClient{Client: baseClient, requestID: "request-new"}
+	h := makeTestHelper(t, instance, racingClient, s)
+	r := &controller.GaleraReconciler{Client: racingClient}
+
+	err := r.CheckForStuckPVCRequiringRemediation(context.Background(), instance, h)
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("expected resource-version conflict after request changes, got %v", err)
+	}
+
+	got := &corev1.PersistentVolumeClaim{}
+	if err := baseClient.Get(context.Background(), types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}, got); err != nil {
+		t.Fatalf("get PVC: %v", err)
+	}
+	if got.Annotations[controller.RequestIDAnnotation] != "request-new" {
+		t.Errorf("request-id = %q, want concurrent request", got.Annotations[controller.RequestIDAnnotation])
+	}
+	if got.Annotations[controller.SafeToDeleteAnnotation] != "" || got.Annotations[controller.ConsentIDAnnotation] != "" {
+		t.Errorf("stale consent was written after request changed: annotations=%v", got.Annotations)
 	}
 }

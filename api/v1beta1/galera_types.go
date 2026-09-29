@@ -151,7 +151,8 @@ type GaleraAttributes struct {
 type PVCRemediationStatus struct {
 	// StuckNode is the Kubernetes node name set by PodRemediator on the PVC.
 	StuckNode string `json:"stuckNode"`
-	// ConsentGranted is true once this controller has set safe-to-delete=true on the PVC.
+	// ConsentGranted is true only when safe-to-delete=true and consent-id matches
+	// the PVC's current request-id.
 	// +kubebuilder:default=false
 	ConsentGranted bool `json:"consentGranted,omitempty"`
 }

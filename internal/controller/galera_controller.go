@@ -96,6 +96,14 @@ const (
 	// SafeToDeleteAnnotation is set by this controller to authorize PodRemediator
 	// to delete the stuck PVC. Consent is per fault-event.
 	SafeToDeleteAnnotation = "remediation.openstack.org/safe-to-delete"
+
+	// RequestIDAnnotation is set by PodRemediator to identify the current
+	// fault-scoped consent request for a PVC.
+	RequestIDAnnotation = "remediation.openstack.org/request-id"
+
+	// ConsentIDAnnotation echoes the exact request ID evaluated by this
+	// controller. It must be written atomically with SafeToDeleteAnnotation.
+	ConsentIDAnnotation = "remediation.openstack.org/consent-id"
 )
 
 // Static errors
@@ -1905,7 +1913,13 @@ func (r *GaleraReconciler) reconcileDelete(ctx context.Context, instance *mariad
 //
 // Annotation contract (shared with infra-operator PodRemediator):
 //   - pvc-stuck-on-node  (remediation.openstack.org/pvc-stuck-on-node): set by PodRemediator
+//   - request-id         (remediation.openstack.org/request-id):         current request from PodRemediator
 //   - safe-to-delete     (remediation.openstack.org/safe-to-delete):     set by this controller
+//   - consent-id         (remediation.openstack.org/consent-id):         echoes the evaluated request-id
+//
+// Consent annotations are written together with optimistic locking. A missing
+// request ID or a consent ID that does not match the current request is never
+// treated as consent.
 //
 // Safety gates (both must pass):
 //  1. k8s gate: AvailableReplicas >= floor(spec.Replicas/2)+1
@@ -1953,8 +1967,9 @@ func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Cont
 	}
 
 	// Single pass: build PVC remediation status (Feature 2) and candidates list.
-	// All PVCs with pvc-stuck-on-node appear in the status map; only those without
-	// safe-to-delete are candidates for consent this reconcile.
+	// All PVCs with pvc-stuck-on-node appear in the status map. A PVC is considered
+	// consented only when safe-to-delete and consent-id match its current request-id;
+	// only PVCs with a non-empty request-id and no matching consent are candidates.
 	newRemediationStatus := make(map[string]mariadbv1.PVCRemediationStatus)
 	candidates := make([]*corev1.PersistentVolumeClaim, 0)
 	for i := range pvcList.Items {
@@ -1962,12 +1977,16 @@ func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Cont
 		if pvc.Annotations == nil || pvc.Annotations[PVCStuckOnNodeAnnotation] == "" {
 			continue
 		}
+		requestID := pvc.Annotations[RequestIDAnnotation]
+		consentGranted := requestID != "" &&
+			pvc.Annotations[SafeToDeleteAnnotation] == "true" &&
+			pvc.Annotations[ConsentIDAnnotation] == requestID
 		entry := mariadbv1.PVCRemediationStatus{
 			StuckNode:      pvc.Annotations[PVCStuckOnNodeAnnotation],
-			ConsentGranted: pvc.Annotations[SafeToDeleteAnnotation] == "true",
+			ConsentGranted: consentGranted,
 		}
 		newRemediationStatus[pvc.Name] = entry
-		if !entry.ConsentGranted {
+		if !consentGranted && requestID != "" {
 			candidates = append(candidates, pvc)
 		}
 	}
@@ -2029,9 +2048,11 @@ func (r *GaleraReconciler) CheckForStuckPVCRequiringRemediation(ctx context.Cont
 	candidate := candidates[0]
 	oldPVC := candidate.DeepCopy()
 	candidate.Annotations[SafeToDeleteAnnotation] = "true"
-	if err := r.Patch(ctx, candidate, client.MergeFrom(oldPVC)); err != nil {
-		Log.Error(err, "Failed to set safe-to-delete annotation on stuck PVC",
-			"pvc", candidate.Name, "node", candidate.Annotations[PVCStuckOnNodeAnnotation])
+	candidate.Annotations[ConsentIDAnnotation] = candidate.Annotations[RequestIDAnnotation]
+	if err := r.Patch(ctx, candidate, client.MergeFromWithOptions(oldPVC, client.MergeFromWithOptimisticLock{})); err != nil {
+		Log.Error(err, "Failed to set request-scoped consent on stuck PVC",
+			"pvc", candidate.Name, "node", candidate.Annotations[PVCStuckOnNodeAnnotation],
+			"requestID", candidate.Annotations[RequestIDAnnotation])
 		return err
 	}
 

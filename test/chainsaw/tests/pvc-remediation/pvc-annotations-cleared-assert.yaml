@@ -1,9 +1,10 @@
-# Assert that both remediation annotations have been removed from the PVC.
-# PodRemediator's Path A removes both annotations when a node recovers;
-# this assert verifies neither annotation survives the cleanup.
+# Assert that the PodRemediator request and consent annotations are removed
+# from the PVC when the node recovers.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: mysql-db-openstack-galera-0
   (annotations.`remediation.openstack.org/pvc-stuck-on-node` || ''): ""
+  (annotations.`remediation.openstack.org/request-id` || ''): ""
   (annotations.`remediation.openstack.org/safe-to-delete` || ''): ""
+  (annotations.`remediation.openstack.org/consent-id` || ''): ""

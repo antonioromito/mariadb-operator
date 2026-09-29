@@ -7,4 +7,6 @@ metadata:
   name: mysql-db-openstack-galera-0
   annotations:
     remediation.openstack.org/pvc-stuck-on-node: worker-0
+    remediation.openstack.org/request-id: test-request-1
     remediation.openstack.org/safe-to-delete: "true"
+    remediation.openstack.org/consent-id: test-request-1
