@@ -79,6 +79,7 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 
 	stsName := mariadb.StatefulSetName(instance.Name)
 	firstStuckPod := ""
+	stuckPVCs := make(map[string]bool, *instance.Spec.Replicas)
 
 	for i := int32(0); i < *instance.Spec.Replicas; i++ {
 		pvcName := mariadb.PVCName(stsName, i)
@@ -89,14 +90,15 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 			}
 			return err
 		}
+		pod := mariadb.PodNameFromPVC(pvcName)
 		// If the PVC has been flagged as "unreachable" by the
 		// PodRemediator, recall its associated pod is "unavailable"
 		node, found := pvc.Annotations[remediationv1.PVCStuckOnNodeAnnotation]
+		stuckPVCs[pod] = found
 		if found {
 			if instance.Status.UnavailablePods == nil {
 				instance.Status.UnavailablePods = make(map[string]mariadbv1.UnavailablePodStatus)
 			}
-			pod := mariadb.PodNameFromPVC(pvcName)
 			desc, unavail := instance.Status.UnavailablePods[pod]
 			if unavail {
 				log.V(-1).Info("Pod blocked due to local PVC being unreachable",
@@ -110,6 +112,45 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 				firstStuckPod = pod
 			}
 		}
+	}
+
+	// A queued PVC-stuck entry can become stale if its node recovers: the pod may
+	// rejoin using the original PVC, and PodRemediator then removes the stuck
+	// annotation without replacing that PVC. Clear only queued entries whose PVC
+	// was observed without the annotation and whose pod is Ready in Galera's
+	// Primary component with local state Synced. Keep active remediations for
+	// CheckForResolvedPodRemediation to clear after recovery.
+	for pod, status := range instance.Status.UnavailablePods {
+		if status.Reason != mariadbv1.PodUnavailabilityReasonPVCStuck || status.Remediation {
+			continue
+		}
+		stuck, observed := stuckPVCs[pod]
+		if !observed || stuck {
+			continue
+		}
+
+		podObj := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pod, Namespace: instance.Namespace}, podObj); err != nil {
+			if k8s_errors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		if !podutils.IsPodReady(podObj) || !isGaleraPrimaryAndSynced(ctx, podObj, instance, helper, r.config) {
+			continue
+		}
+
+		log.Info("Clearing queued PVC unavailability after pod recovered on its existing PVC",
+			"pod", pod,
+			"pvc", mariadb.PVCNameFromPod(pod),
+			"stuckNode", status.Node,
+			"podReady", true,
+			"wsrepClusterStatus", "Primary",
+			"wsrepLocalState", "Synced")
+		delete(instance.Status.UnavailablePods, pod)
+	}
+	if len(instance.Status.UnavailablePods) == 0 {
+		instance.Status.UnavailablePods = nil
 	}
 
 	// Start one remediation after all currently stuck PVCs have been recorded.
