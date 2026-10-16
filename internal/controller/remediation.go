@@ -78,6 +78,7 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 	log := helper.GetLogger()
 
 	stsName := mariadb.StatefulSetName(instance.Name)
+	firstStuckPod := ""
 
 	for i := int32(0); i < *instance.Spec.Replicas; i++ {
 		pvcName := mariadb.PVCName(stsName, i)
@@ -96,24 +97,26 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 				instance.Status.UnavailablePods = make(map[string]mariadbv1.UnavailablePodStatus)
 			}
 			pod := mariadb.PodNameFromPVC(pvcName)
-			desc := mariadbv1.UnavailablePodStatus{
-				Reason: mariadbv1.PodUnavailabilityReasonPVCStuck,
-				Node:   node,
-			}
-
-			if _, unavail := instance.Status.UnavailablePods[pod]; unavail {
+			desc, unavail := instance.Status.UnavailablePods[pod]
+			if unavail {
 				log.V(-1).Info("Pod blocked due to local PVC being unreachable",
 					"pod", pod, "pvc", pvcName, "node", node)
 			}
-
-			// If no other recovery is tracked by the mariadb-operator
-			// process this PVC to prepare recovery
-			if _, inProgress := instance.Status.RemediationInProgress(); !inProgress {
-				desc.Remediation = true
-			}
-
+			desc.Reason = mariadbv1.PodUnavailabilityReasonPVCStuck
+			desc.Node = node
 			instance.Status.UnavailablePods[pod] = desc
+
+			if firstStuckPod == "" {
+				firstStuckPod = pod
+			}
 		}
+	}
+
+	// Start one remediation after all currently stuck PVCs have been recorded.
+	if _, inProgress := instance.Status.RemediationInProgress(); !inProgress && firstStuckPod != "" {
+		desc := instance.Status.UnavailablePods[firstStuckPod]
+		desc.Remediation = true
+		instance.Status.UnavailablePods[firstStuckPod] = desc
 	}
 
 	// At this point, all pods currently unavailable have been tagged,
