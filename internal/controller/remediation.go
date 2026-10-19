@@ -117,15 +117,16 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 				Remediation: false,
 			}
 
-			// If no remediation is ongoing, recall to start one for this pod
+			// Reserve the remediation slot so later PVCs in this scan stay queued.
 			if !remediationInProgress {
 				desc.Remediation = true
+				remediationInProgress = true
 				// If this pod was being remediated, do not lose track of it
 			} else if remediationPodName == podName {
 				desc.Remediation = true
 			}
 
-			instance.Status.UnavailablePods[podName] = unavailableStatus
+			instance.Status.UnavailablePods[podName] = desc
 		} else {
 			// otherwise, the PVC is not "stuck", make sure there is no
 			// lingering pod status in the galera CR status (e.g. if the
