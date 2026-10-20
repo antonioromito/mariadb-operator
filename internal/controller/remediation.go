@@ -115,6 +115,7 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 			// If no remediation is ongoing, recall to start one for this pod
 			if !remediationInProgress {
 				desc.Remediation = true
+				remediationInProgress = true
 				// If this pod was being remediated, do not lose track of it
 			} else if remediationPodName == podName {
 				desc.Remediation = true
