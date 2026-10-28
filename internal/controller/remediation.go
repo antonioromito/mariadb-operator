@@ -64,6 +64,7 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 	ctx context.Context,
 	instance *mariadbv1.Galera,
 	helper *helper.Helper,
+	availableReplicas int32,
 ) error {
 	if instance.Spec.Replicas == nil {
 		return nil
@@ -149,7 +150,7 @@ func (r *GaleraReconciler) EnsurePVCAvailability(
 	// At this point, all pods currently unavailable have been tagged,
 	// So check whether a new remediation action must be initiated or
 	// if an existing remediation must be tracked.
-	if err := r.CheckForPendingPodRemediation(ctx, instance, helper); err != nil {
+	if err := r.CheckForPendingPodRemediation(ctx, instance, helper, availableReplicas); err != nil {
 		return err
 	}
 
@@ -171,6 +172,7 @@ func (r *GaleraReconciler) CheckForPendingPodRemediation(
 	ctx context.Context,
 	instance *mariadbv1.Galera,
 	helper *helper.Helper,
+	availableReplicas int32,
 ) error {
 	log := helper.GetLogger()
 
@@ -207,6 +209,16 @@ func (r *GaleraReconciler) CheckForPendingPodRemediation(
 	// nothing left to be done until the pod restarts and its local
 	// galera is synced
 	if pvc.Annotations[remediationv1.SafeToDeleteAnnotation] == "true" {
+		return nil
+	}
+
+	// Do not replace a PVC unless a strict majority of Galera replicas is available.
+	requiredQuorum := *instance.Spec.Replicas/2 + 1
+	if availableReplicas < requiredQuorum {
+		log.Info("Deferring PVC remediation until Galera quorum is available",
+			"pod", podName, "pvc", pvcName,
+			"availableReplicas", availableReplicas,
+			"requiredReplicas", requiredQuorum)
 		return nil
 	}
 

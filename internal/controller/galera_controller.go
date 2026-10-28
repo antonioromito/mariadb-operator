@@ -1227,7 +1227,7 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 	// and process with recovery if needed.
 	// TODO(dciabrin) check only when some replicas are not started/ready?
 	preRemediationCheck := maps.Clone(instance.Status.UnavailablePods)
-	if err := r.EnsurePVCAvailability(ctx, instance, helper); err != nil {
+	if err := r.EnsurePVCAvailability(ctx, instance, helper, statefulset.Status.AvailableReplicas); err != nil {
 		log.Error(err, "PVC availability check failed; skipping this cycle")
 	}
 	if !reflect.DeepEqual(preRemediationCheck, instance.Status.UnavailablePods) {
